@@ -1,4 +1,4 @@
-package cdc_test
+package jetstream_test
 
 import (
 	"bytes"
@@ -17,9 +17,14 @@ import (
 	"time"
 
 	"github.com/Deasel011/go-cdc"
+	"github.com/Deasel011/go-cdc/capture"
+	"github.com/Deasel011/go-cdc/data"
+	"github.com/Deasel011/go-cdc/data/postgres"
+	"github.com/Deasel011/go-cdc/data/sqlite"
+	"github.com/Deasel011/go-cdc/stream/jetstream"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
+	natsjs "github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -80,15 +85,17 @@ func afterSQLiteWrites() []item {
 type ReplicationSuite struct {
 	suite.Suite
 
-	admin *sql.DB
-	ns    *server.Server
-	nc    *nats.Conn
-	js    jetstream.JetStream
+	admin     *sql.DB
+	ns        *server.Server
+	nc        *nats.Conn
+	js        natsjs.JetStream
+	pgStore   *data.SQL
+	liteStore *data.SQL
 
 	ctx         context.Context
 	cancel      context.CancelFunc
-	pg          *cdc.DB
-	lite        *cdc.DB
+	pg          *capture.DB
+	lite        *capture.DB
 	pgName      string
 	stream      string
 	subject     string
@@ -97,15 +104,15 @@ type ReplicationSuite struct {
 	errCh       chan error
 
 	rejected error
-	raw      jetstream.RawStreamMsg
-	ack      *jetstream.PubAck
+	raw      natsjs.RawStreamMsg
+	ack      *natsjs.PubAck
 	before   int
 }
 
 func (s *ReplicationSuite) SetupSuite() {
 	s.T().Cleanup(s.shutdownShared)
 
-	admin, err := sql.Open(cdc.DriverPostgres, postgresSocketDSN("postgres"))
+	admin, err := sql.Open(postgres.Dialect{}.Driver(), postgresSocketDSN("postgres"))
 	s.Require().NoError(err)
 	admin.SetMaxOpenConns(1)
 	s.Require().NoError(admin.PingContext(s.T().Context()))
@@ -128,7 +135,7 @@ func (s *ReplicationSuite) SetupSuite() {
 	nc, err := nats.Connect(ns.ClientURL())
 	s.Require().NoError(err)
 	s.nc = nc
-	js, err := jetstream.New(nc)
+	js, err := natsjs.New(nc)
 	s.Require().NoError(err)
 	s.js = js
 }
@@ -158,7 +165,7 @@ func (s *ReplicationSuite) SetupTest() {
 	s.errCh = make(chan error, 8)
 	s.rejected = nil
 	s.ack = nil
-	s.raw = jetstream.RawStreamMsg{}
+	s.raw = natsjs.RawStreamMsg{}
 	s.before = 0
 	s.streamReady = false
 
@@ -168,31 +175,31 @@ func (s *ReplicationSuite) SetupTest() {
 	_, err := s.admin.ExecContext(ctx, "CREATE DATABASE "+pgQuote(s.pgName))
 	s.Require().NoError(err)
 
-	s.Require().NoError(cdc.EnsureStream(ctx, s.js, s.stream, s.subject))
+	s.Require().NoError(jetstream.EnsureStream(ctx, s.js, s.stream, s.subject))
 	s.streamReady = true
 
-	pg, err := cdc.Open(ctx, cdc.Config{
-		Driver:  cdc.DriverPostgres,
-		DSN:     postgresSocketDSN(s.pgName),
-		Origin:  "postgres",
-		Subject: s.subject,
-		Tables:  []cdc.Table{{Name: "items", Key: []string{"id"}}},
+	pg, err := capture.Open(ctx, postgres.Dialect{}, capture.Config{
+		DSN:    postgresSocketDSN(s.pgName),
+		Origin: "postgres",
+		Tables: []capture.Table{{Name: "items", Key: []string{"id"}}},
 	})
 	s.Require().NoError(err)
 	s.pg = pg
 	_, err = pg.Std().ExecContext(ctx, pgItemsDDL)
 	s.Require().NoError(err)
+	s.pgStore, err = data.Open(ctx, pg.Std(), postgres.Dialect{})
+	s.Require().NoError(err)
 
-	lite, err := cdc.Open(ctx, cdc.Config{
-		Driver:  cdc.DriverSQLite,
-		DSN:     "file:" + filepath.Join(s.T().TempDir(), "replica.db"),
-		Origin:  "sqlite",
-		Subject: s.subject,
-		Tables:  []cdc.Table{{Name: "items", Key: []string{"id"}}},
+	lite, err := capture.Open(ctx, sqlite.Dialect{}, capture.Config{
+		DSN:    "file:" + filepath.Join(s.T().TempDir(), "replica.db"),
+		Origin: "sqlite",
+		Tables: []capture.Table{{Name: "items", Key: []string{"id"}}},
 	})
 	s.Require().NoError(err)
 	s.lite = lite
 	_, err = lite.Std().ExecContext(ctx, sqliteItemsDDL)
+	s.Require().NoError(err)
+	s.liteStore, err = data.Open(ctx, lite.Std(), sqlite.Dialect{})
 	s.Require().NoError(err)
 }
 
@@ -241,22 +248,21 @@ func (s *ReplicationSuite) When(step func()) *ReplicationSuite { return s.Given(
 func (s *ReplicationSuite) Then(step func()) *ReplicationSuite { return s.Given(step) }
 
 func (s *ReplicationSuite) ReplicationRunningBothWays() {
-	start := func(db *cdc.DB, driver, durable, skip string) {
-		ap, err := cdc.NewApplier(cdc.ApplyConfig{
-			JS:         s.js,
-			Stream:     s.stream,
-			Subject:    s.subject,
-			Durable:    durable,
-			Target:     db.Std(),
-			Driver:     driver,
-			SkipOrigin: skip,
+	start := func(db *capture.DB, store *data.SQL, durable, skip string) {
+		s.background(func(ctx context.Context) error {
+			return jetstream.Publish(ctx, s.js, s.subject, db)
 		})
-		s.Require().NoError(err)
-		s.background(func(ctx context.Context) error { return db.Relay(ctx, s.js) })
-		s.background(ap.Run)
+		s.background(func(ctx context.Context) error {
+			return jetstream.Consume(ctx, s.js, jetstream.ConsumeConfig{
+				Stream:     s.stream,
+				Subject:    s.subject,
+				Durable:    durable,
+				SkipOrigin: skip,
+			}, store)
+		})
 	}
-	start(s.pg, cdc.DriverPostgres, "apply-on-postgres", "postgres")
-	start(s.lite, cdc.DriverSQLite, "apply-on-sqlite", "sqlite")
+	start(s.pg, s.pgStore, "apply-on-postgres", "postgres")
+	start(s.lite, s.liteStore, "apply-on-sqlite", "sqlite")
 }
 
 func (s *ReplicationSuite) AnInsertHasBeenPublished() {
@@ -283,7 +289,7 @@ func (s *ReplicationSuite) AnUnsupportedWriteIsAttempted() {
 }
 
 func (s *ReplicationSuite) TheWriteIsRejectedAndNothingIsStored() {
-	s.Require().ErrorIs(s.rejected, cdc.ErrUnsupportedSyntax)
+	s.Require().ErrorIs(s.rejected, capture.ErrUnsupportedStatement)
 	var n int64
 	s.Require().NoError(s.pg.QueryRowContext(s.T().Context(), `SELECT COUNT(*) FROM items`).Scan(&n))
 	s.Require().Zero(n)
@@ -322,9 +328,9 @@ func (s *ReplicationSuite) SQLiteShowsTheCommittedPostgresRows() {
 func (s *ReplicationSuite) TheStreamHasOnlyTheCommittedPostgresChanges() {
 	s.Require().NoError(s.backgroundErr())
 	s.Require().Equal([]streamChange{
-		{"postgres", cdc.OpInsert},
-		{"postgres", cdc.OpUpdate},
-		{"postgres", cdc.OpInsert},
+		{"postgres", cdc.Insert},
+		{"postgres", cdc.Update},
+		{"postgres", cdc.Insert},
 	}, changes(s.events()))
 }
 
@@ -333,9 +339,9 @@ func (s *ReplicationSuite) TheFirstEventIsRepublishedWithTheSameMsgID() {
 	s.Require().NotEmpty(msgs)
 	s.before = len(msgs)
 	s.raw = msgs[0]
-	var ev cdc.Event
+	var ev cdc.Change
 	s.Require().NoError(json.Unmarshal(s.raw.Data, &ev))
-	ack, err := s.js.Publish(s.T().Context(), s.subject, bytes.Clone(s.raw.Data), jetstream.WithMsgID(ev.MsgID))
+	ack, err := s.js.Publish(s.T().Context(), s.subject, bytes.Clone(s.raw.Data), natsjs.WithMsgID(ev.ID))
 	s.Require().NoError(err)
 	s.ack = ack
 }
@@ -345,7 +351,7 @@ func (s *ReplicationSuite) TheStreamDoesNotGrow() {
 	s.Require().True(s.ack.Duplicate)
 	msgs := s.messages()
 	s.Require().Len(msgs, s.before)
-	s.Require().NotEmpty(msgs[0].Header.Get(jetstream.MsgIDHeader))
+	s.Require().NotEmpty(msgs[0].Header.Get(natsjs.MsgIDHeader))
 }
 
 func (s *ReplicationSuite) PostgresCommitsADelete() {
@@ -360,20 +366,19 @@ func (s *ReplicationSuite) SQLiteNoLongerHasTheDeletedRow() {
 func (s *ReplicationSuite) SQLiteIsWipedAndTheStreamIsReplayed() {
 	_, err := s.lite.Std().ExecContext(s.T().Context(), `DELETE FROM items`)
 	s.Require().NoError(err)
+	_, err = s.lite.Std().ExecContext(s.T().Context(), `DELETE FROM cdc_applied`)
+	s.Require().NoError(err)
 	var n int64
 	s.Require().NoError(s.lite.QueryRowContext(s.T().Context(), `SELECT COUNT(*) FROM items`).Scan(&n))
 	s.Require().Zero(n)
-	ap, err := cdc.NewApplier(cdc.ApplyConfig{
-		JS:         s.js,
-		Stream:     s.stream,
-		Subject:    s.subject,
-		Durable:    "replay-on-sqlite",
-		Target:     s.lite.Std(),
-		Driver:     cdc.DriverSQLite,
-		SkipOrigin: "sqlite",
+	s.background(func(ctx context.Context) error {
+		return jetstream.Consume(ctx, s.js, jetstream.ConsumeConfig{
+			Stream:     s.stream,
+			Subject:    s.subject,
+			Durable:    "replay-on-sqlite",
+			SkipOrigin: "sqlite",
+		}, s.liteStore)
 	})
-	s.Require().NoError(err)
-	s.background(ap.Run)
 }
 
 func (s *ReplicationSuite) SQLiteMatchesTheCommittedPostgresState() {
@@ -400,22 +405,23 @@ func (s *ReplicationSuite) NoEchoWasPublished() {
 	s.Require().NoError(s.backgroundErr())
 	got := changes(s.events())
 	want := []streamChange{
-		{"postgres", cdc.OpInsert},
-		{"postgres", cdc.OpUpdate},
-		{"postgres", cdc.OpInsert},
-		{"postgres", cdc.OpDelete},
-		{"sqlite", cdc.OpUpdate},
-		{"sqlite", cdc.OpInsert},
+		{"postgres", cdc.Insert},
+		{"postgres", cdc.Update},
+		{"postgres", cdc.Insert},
+		{"postgres", cdc.Delete},
+		{"sqlite", cdc.Update},
+		{"sqlite", cdc.Insert},
 	}
 	s.Require().Equal(want, got)
 	s.Require().Len(changes(s.events()), len(got))
 }
 
 func (s *ReplicationSuite) AMaliciousEventIsPublished() {
-	ev := cdc.Event{
-		MsgID:  "evil-1",
+	ev := cdc.Change{
+		ID:     "evil-1",
 		Origin: "attacker",
-		Op:     cdc.OpDelete,
+		Seq:    1,
+		Op:     cdc.Delete,
 		Table:  `items"; DROP TABLE items; --`,
 		Key: []cdc.Field{{
 			Name:  "id",
@@ -424,31 +430,37 @@ func (s *ReplicationSuite) AMaliciousEventIsPublished() {
 	}
 	body, err := json.Marshal(ev)
 	s.Require().NoError(err)
-	_, err = s.js.Publish(s.T().Context(), s.subject, body, jetstream.WithMsgID(ev.MsgID))
+	_, err = s.js.Publish(s.T().Context(), s.subject, body, natsjs.WithMsgID(ev.ID))
 	s.Require().NoError(err)
 }
 
 func (s *ReplicationSuite) TheApplierStopsAndTheTableRemains() {
-	ap, err := cdc.NewApplier(cdc.ApplyConfig{
-		JS:         s.js,
-		Stream:     s.stream,
-		Subject:    s.subject,
-		Durable:    "reject-on-sqlite",
-		Target:     s.lite.Std(),
-		Driver:     cdc.DriverSQLite,
-		SkipOrigin: "sqlite",
+	// A bad change is terminated. The consumer keeps going, so a later insert lands.
+	s.background(func(ctx context.Context) error {
+		return jetstream.Consume(ctx, s.js, jetstream.ConsumeConfig{
+			Stream:     s.stream,
+			Subject:    s.subject,
+			Durable:    "reject-on-sqlite",
+			SkipOrigin: "sqlite",
+		}, s.liteStore)
 	})
+	good := cdc.Change{
+		ID: "good-1", Origin: "postgres", Seq: 2, Op: cdc.Insert, Table: "items",
+		Key: []cdc.Field{{Name: "id", Value: cdc.Value{Type: "int", Data: "1"}}},
+		After: []cdc.Field{
+			{Name: "id", Value: cdc.Value{Type: "int", Data: "1"}},
+			{Name: "name", Value: cdc.Value{Type: "string", Data: "ok"}},
+			{Name: "qty", Value: cdc.Value{Type: "int", Data: "1"}},
+		},
+	}
+	body, err := json.Marshal(good)
 	s.Require().NoError(err)
-	ctx, cancel := context.WithTimeout(s.T().Context(), 20*time.Second)
-	defer cancel()
-	err = ap.Run(ctx)
-	s.Require().ErrorIs(err, cdc.ErrInvalidIdentifier)
+	_, err = s.js.Publish(s.T().Context(), s.subject, body, natsjs.WithMsgID(good.ID))
+	s.Require().NoError(err)
+	s.waitRows(s.lite, []item{{ID: 1, Name: "ok", Qty: 1}})
 	var name string
 	s.Require().NoError(s.lite.QueryRowContext(s.T().Context(), `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'items'`).Scan(&name))
 	s.Require().Equal("items", name)
-	var n int64
-	s.Require().NoError(s.lite.QueryRowContext(s.T().Context(), `SELECT COUNT(*) FROM items`).Scan(&n))
-	s.Require().Zero(n)
 }
 
 func (s *ReplicationSuite) background(fn func(context.Context) error) {
@@ -480,7 +492,7 @@ func (s *ReplicationSuite) waitBoth(want []item) {
 	s.waitOutbox(s.lite)
 }
 
-func (s *ReplicationSuite) waitRows(db *cdc.DB, want []item) {
+func (s *ReplicationSuite) waitRows(db *capture.DB, want []item) {
 	s.T().Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	tick := time.NewTicker(20 * time.Millisecond)
@@ -505,7 +517,7 @@ func (s *ReplicationSuite) waitRows(db *cdc.DB, want []item) {
 	}
 }
 
-func (s *ReplicationSuite) waitOutbox(db *cdc.DB) {
+func (s *ReplicationSuite) waitOutbox(db *capture.DB) {
 	s.T().Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	tick := time.NewTicker(20 * time.Millisecond)
@@ -530,7 +542,7 @@ func (s *ReplicationSuite) waitOutbox(db *cdc.DB) {
 	}
 }
 
-func (s *ReplicationSuite) messages() []jetstream.RawStreamMsg {
+func (s *ReplicationSuite) messages() []natsjs.RawStreamMsg {
 	s.T().Helper()
 	ctx := s.T().Context()
 	st, err := s.js.Stream(ctx, s.stream)
@@ -540,7 +552,7 @@ func (s *ReplicationSuite) messages() []jetstream.RawStreamMsg {
 	if info.State.Msgs == 0 {
 		return nil
 	}
-	out := make([]jetstream.RawStreamMsg, 0, info.State.Msgs)
+	out := make([]natsjs.RawStreamMsg, 0, info.State.Msgs)
 	for seq := info.State.FirstSeq; seq <= info.State.LastSeq; seq++ {
 		msg, err := st.GetMsg(ctx, seq)
 		s.Require().NoError(err)
@@ -550,10 +562,10 @@ func (s *ReplicationSuite) messages() []jetstream.RawStreamMsg {
 	return out
 }
 
-func (s *ReplicationSuite) events() []cdc.Event {
+func (s *ReplicationSuite) events() []cdc.Change {
 	s.T().Helper()
 	msgs := s.messages()
-	out := make([]cdc.Event, len(msgs))
+	out := make([]cdc.Change, len(msgs))
 	for i, msg := range msgs {
 		s.Require().NoError(json.Unmarshal(msg.Data, &out[i]))
 	}
@@ -562,10 +574,10 @@ func (s *ReplicationSuite) events() []cdc.Event {
 
 type streamChange struct {
 	Origin string
-	Op     string
+	Op     cdc.Op
 }
 
-func changes(events []cdc.Event) []streamChange {
+func changes(events []cdc.Change) []streamChange {
 	out := make([]streamChange, len(events))
 	for i, ev := range events {
 		out[i] = streamChange{Origin: ev.Origin, Op: ev.Op}
@@ -573,7 +585,7 @@ func changes(events []cdc.Event) []streamChange {
 	return out
 }
 
-func readItems(ctx context.Context, db *cdc.DB) ([]item, error) {
+func readItems(ctx context.Context, db *capture.DB) ([]item, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, name, qty, note FROM items ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -590,7 +602,7 @@ func readItems(ctx context.Context, db *cdc.DB) ([]item, error) {
 	return out, rows.Err()
 }
 
-func outboxCount(ctx context.Context, db *cdc.DB) (int64, error) {
+func outboxCount(ctx context.Context, db *capture.DB) (int64, error) {
 	var n int64
 	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cdc_outbox`).Scan(&n)
 	return n, err

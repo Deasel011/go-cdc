@@ -1,14 +1,10 @@
-package cdc
+package sqlparse
 
 import (
-	"database/sql"
-	"database/sql/driver"
-	"encoding/base64"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
-	"time"
+
+	"github.com/Deasel011/go-cdc"
 )
 
 // shortcut: single-row INSERT, UPDATE, and DELETE only. Values are placeholders
@@ -16,14 +12,14 @@ import (
 // key combined with AND. Upgrade when multi-row writes or other predicates must be captured.
 
 type parsed struct {
-	op        string
+	op        cdc.Op
 	table     string
 	cols      []string
 	nums      []int
-	colVals   []Value
+	colVals   []cdc.Value
 	where     []string
 	whereNums []int
-	whereVals []Value
+	whereVals []cdc.Value
 }
 
 func parseDML(sqlText string, args []any) (parsed, error) {
@@ -37,7 +33,7 @@ func parseDML(sqlText string, args []any) (parsed, error) {
 		return parsed{}, err
 	}
 	if kw.kind != tokKeyword {
-		return parsed{}, ErrUnsupportedStatement
+		return parsed{}, errUnsupported
 	}
 	var stmt parsed
 	switch kw.text {
@@ -48,16 +44,13 @@ func parseDML(sqlText string, args []any) (parsed, error) {
 	case "delete":
 		stmt, err = p.parseDelete()
 	default:
-		return parsed{}, ErrUnsupportedStatement
+		return parsed{}, errUnsupported
 	}
 	if err != nil {
 		return parsed{}, err
 	}
 	if err := p.end(); err != nil {
 		return parsed{}, err
-	}
-	if stmt.table == outboxTable {
-		return parsed{}, ErrCaptureOutbox
 	}
 	if err := stmt.bind(args); err != nil {
 		return parsed{}, err
@@ -78,110 +71,31 @@ func (stmt *parsed) bind(args []any) error {
 	return nil
 }
 
-func bindArgs(args []any, nums []int) ([]Value, error) {
+func bindArgs(args []any, nums []int) ([]cdc.Value, error) {
 	seen := make(map[int]bool, len(nums))
 	maxn := 0
 	for _, n := range nums {
 		if n < 1 {
-			return nil, fmt.Errorf("%w: %d", ErrInvalidPlaceholder, n)
+			return nil, fmt.Errorf("%w: %d", errInvalidPlaceholder, n)
 		}
 		if seen[n] {
-			return nil, fmt.Errorf("%w: $%d", ErrPlaceholderReused, n)
+			return nil, fmt.Errorf("%w: $%d", errPlaceholderReused, n)
 		}
 		seen[n] = true
 		maxn = max(maxn, n)
 	}
 	if len(args) != maxn || len(seen) != len(args) {
-		return nil, ErrPlaceholderArity
+		return nil, errPlaceholderArity
 	}
-	out := make([]Value, len(nums))
+	out := make([]cdc.Value, len(nums))
 	for i, n := range nums {
-		v, err := encodeValue(args[n-1])
+		v, err := cdc.NewValue(args[n-1])
 		if err != nil {
 			return nil, err
 		}
 		out[i] = v
 	}
 	return out, nil
-}
-
-func encodeValue(v any) (Value, error) {
-	if _, ok := v.(sql.NamedArg); ok {
-		// shortcut: sql.Named arguments are unsupported; pass positional args.
-		return Value{}, ErrNamedArg
-	}
-	dv, err := driver.DefaultParameterConverter.ConvertValue(v)
-	if err != nil {
-		return Value{}, fmt.Errorf("%w: %w", ErrUnsupportedValue, err)
-	}
-	switch x := dv.(type) {
-	case nil:
-		return Value{Type: "null"}, nil
-	case int64:
-		return Value{Type: "int", Data: strconv.FormatInt(x, 10)}, nil
-	case float64:
-		if math.IsNaN(x) || math.IsInf(x, 0) {
-			return Value{}, ErrNonFiniteFloat
-		}
-		return Value{Type: "float", Data: strconv.FormatFloat(x, 'g', -1, 64)}, nil
-	case bool:
-		return Value{Type: "bool", Data: strconv.FormatBool(x)}, nil
-	case string:
-		return Value{Type: "string", Data: x}, nil
-	case []byte:
-		if x == nil {
-			return Value{Type: "null"}, nil
-		}
-		return Value{Type: "bytes", Data: base64.StdEncoding.EncodeToString(x)}, nil
-	case time.Time:
-		return Value{Type: "time", Data: x.UTC().Format(time.RFC3339Nano)}, nil
-	default:
-		return Value{}, fmt.Errorf("%w: %T", ErrUnsupportedValue, dv)
-	}
-}
-
-func (v Value) bind() (any, error) {
-	switch v.Type {
-	case "null":
-		if v.Data != "" {
-			return nil, ErrNullData
-		}
-		return nil, nil
-	case "int":
-		n, err := strconv.ParseInt(v.Data, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("%w: int: %w", ErrBadValue, err)
-		}
-		return n, nil
-	case "float":
-		n, err := strconv.ParseFloat(v.Data, 64)
-		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
-			return nil, fmt.Errorf("%w: float %q", ErrBadValue, v.Data)
-		}
-		return n, nil
-	case "bool":
-		n, err := strconv.ParseBool(v.Data)
-		if err != nil {
-			return nil, fmt.Errorf("%w: bool: %w", ErrBadValue, err)
-		}
-		return n, nil
-	case "string":
-		return v.Data, nil
-	case "bytes":
-		b, err := base64.StdEncoding.DecodeString(v.Data)
-		if err != nil {
-			return nil, fmt.Errorf("%w: bytes: %w", ErrBadValue, err)
-		}
-		return b, nil
-	case "time":
-		t, err := time.Parse(time.RFC3339Nano, v.Data)
-		if err != nil {
-			return nil, fmt.Errorf("%w: time: %w", ErrBadValue, err)
-		}
-		return t, nil
-	default:
-		return nil, fmt.Errorf("%w: %q", ErrUnknownValueType, v.Type)
-	}
 }
 
 type tokKind int
@@ -252,7 +166,7 @@ func tokenize(sqlText string) ([]token, error) {
 			i = next
 		default:
 			if !isIdentStart(sqlText[i]) {
-				return nil, fmt.Errorf("%w: %q", ErrUnsupportedSyntax, sqlText[i:])
+				return nil, fmt.Errorf("%w: %q", errSyntax, sqlText[i:])
 			}
 			j := i + 1
 			for j < len(sqlText) && isIdentCont(sqlText[j]) {
@@ -268,10 +182,10 @@ func tokenize(sqlText string) ([]token, error) {
 		}
 	}
 	if dollar && sawQmark {
-		return nil, ErrMixedPlaceholders
+		return nil, errMixedPlaceholders
 	}
 	if len(toks) == 0 {
-		return nil, ErrEmptyStatement
+		return nil, errEmpty
 	}
 	return toks, nil
 }
@@ -279,7 +193,7 @@ func tokenize(sqlText string) ([]token, error) {
 func scanDollar(sqlText string, i int) (int, int, error) {
 	j := i + 1
 	if j >= len(sqlText) || sqlText[j] < '1' || sqlText[j] > '9' {
-		return 0, 0, ErrInvalidPlaceholder
+		return 0, 0, errInvalidPlaceholder
 	}
 	n := 0
 	for j < len(sqlText) && sqlText[j] >= '0' && sqlText[j] <= '9' {
@@ -287,7 +201,7 @@ func scanDollar(sqlText string, i int) (int, int, error) {
 		j++
 	}
 	if n < 1 {
-		return 0, 0, ErrInvalidPlaceholder
+		return 0, 0, errInvalidPlaceholder
 	}
 	return n, j, nil
 }
@@ -298,10 +212,10 @@ func scanQuoted(sqlText string, i int) (string, int, error) {
 		j++
 	}
 	if j >= len(sqlText) {
-		return "", 0, ErrUnterminatedIdent
+		return "", 0, errUnterminatedIdent
 	}
 	name := strings.ToLower(sqlText[i+1 : j])
-	if _, err := quoteIdent(name); err != nil {
+	if err := cdc.ValidIdent(name); err != nil {
 		return "", 0, err
 	}
 	return name, j + 1, nil
@@ -343,7 +257,7 @@ func (p *parser) peek() (token, bool) {
 func (p *parser) next() (token, error) {
 	t, ok := p.peek()
 	if !ok {
-		return token{}, ErrUnexpectedEnd
+		return token{}, errUnexpectedEnd
 	}
 	p.i++
 	return t, nil
@@ -355,7 +269,7 @@ func (p *parser) keyword(want string) error {
 		return err
 	}
 	if t.kind != tokKeyword || t.text != want {
-		return fmt.Errorf("%w: %s", ErrExpectedToken, want)
+		return fmt.Errorf("%w: %s", errExpectedToken, want)
 	}
 	return nil
 }
@@ -366,7 +280,7 @@ func (p *parser) ident() (string, error) {
 		return "", err
 	}
 	if t.kind != tokIdent {
-		return "", ErrExpectedToken
+		return "", errExpectedToken
 	}
 	return t.text, nil
 }
@@ -377,7 +291,7 @@ func (p *parser) ph() (int, error) {
 		return 0, err
 	}
 	if t.kind != tokPlaceholder {
-		return 0, ErrExpectedToken
+		return 0, errExpectedToken
 	}
 	return t.num, nil
 }
@@ -390,11 +304,11 @@ func (p *parser) end() error {
 	if t.kind == tokSemi {
 		p.i++
 		if _, ok := p.peek(); ok {
-			return ErrUnexpectedTrailing
+			return errUnexpectedTrailing
 		}
 		return nil
 	}
-	return ErrUnexpectedTrailing
+	return errUnexpectedTrailing
 }
 
 func (p *parser) parseInsert() (parsed, error) {
@@ -417,9 +331,9 @@ func (p *parser) parseInsert() (parsed, error) {
 		return parsed{}, err
 	}
 	if len(cols) != len(nums) {
-		return parsed{}, ErrColumnCount
+		return parsed{}, errColumnCount
 	}
-	return parsed{op: OpInsert, table: table, cols: cols, nums: nums}, nil
+	return parsed{op: cdc.Insert, table: table, cols: cols, nums: nums}, nil
 }
 
 func (p *parser) parseUpdate() (parsed, error) {
@@ -438,7 +352,7 @@ func (p *parser) parseUpdate() (parsed, error) {
 	if err != nil {
 		return parsed{}, err
 	}
-	return parsed{op: OpUpdate, table: table, cols: cols, nums: nums, where: where, whereNums: whereNums}, nil
+	return parsed{op: cdc.Update, table: table, cols: cols, nums: nums, where: where, whereNums: whereNums}, nil
 }
 
 func (p *parser) parseDelete() (parsed, error) {
@@ -453,7 +367,7 @@ func (p *parser) parseDelete() (parsed, error) {
 	if err != nil {
 		return parsed{}, err
 	}
-	return parsed{op: OpDelete, table: table, where: where, whereNums: whereNums}, nil
+	return parsed{op: cdc.Delete, table: table, where: where, whereNums: whereNums}, nil
 }
 
 func (p *parser) identList() ([]string, error) {
@@ -477,7 +391,7 @@ func (p *parser) identList() ([]string, error) {
 		case tokComma:
 			continue
 		default:
-			return nil, ErrExpectedToken
+			return nil, errExpectedToken
 		}
 	}
 }
@@ -503,7 +417,7 @@ func (p *parser) numList() ([]int, error) {
 		case tokComma:
 			continue
 		default:
-			return nil, ErrExpectedToken
+			return nil, errExpectedToken
 		}
 	}
 }
@@ -567,7 +481,7 @@ func (p *parser) expect(kind tokKind) (token, error) {
 		return token{}, err
 	}
 	if t.kind != kind {
-		return token{}, ErrExpectedToken
+		return token{}, errExpectedToken
 	}
 	return t, nil
 }

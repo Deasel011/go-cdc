@@ -1,65 +1,54 @@
 # go-cdc
 
-`cdc` binds `database/sql` to NATS JetStream so a database can be replicated without tying the capture path to one engine's log.
+`cdc` is the vocabulary for replicating a database through a change stream. Postgres and SQLite both speak `database/sql`, and SQLite has no equivalent of Postgres logical replication, so changes are captured in the client, inside the transaction that made them. The same path runs in either direction.
 
-Postgres and SQLite both speak `database/sql`. Postgres logical replication has no SQLite equivalent, so changes are captured in the client, inside the transaction that made them. The same path runs in either direction: Postgres to SQLite, and SQLite to Postgres.
+## Packages
 
-## How it works
+| Package | Role |
+| --- | --- |
+| `cdc` | `Change`, `Capture`, and `Data`. No drivers, no NATS. |
+| `capture` | `database/sql` wrapper. Committed writes land in `cdc_outbox`. `Changes` reads that outbox in order. |
+| `capture/internal/sqlparse` | The single-row INSERT/UPDATE/DELETE subset. |
+| `data` | Applies a `Change` with a `Dialect`. |
+| `data/postgres`, `data/sqlite` | Engine differences and the driver import. |
+| `stream/jetstream` | Publishes a `Capture` to JetStream and consumes it into a `Data`. |
 
-1. `Open` wraps a `pgx` or `sqlite` pool and creates a `cdc_outbox` table.
-2. `ExecContext` / `Tx.Commit` run the write and insert one outbox row per change in that same transaction. A rollback publishes nothing. A crash after commit leaves the row for `Relay`.
-3. `Relay` publishes each row to one JetStream subject, using the outbox message id as the JetStream message id, and deletes the row only after the server accepts it.
-4. `Applier` reads that subject in order and applies the event with bound parameters. Inserts are `INSERT ... ON CONFLICT DO UPDATE`. Updates and deletes match the primary key.
+`modernc.org/sqlite` is the SQLite driver because it is pure Go, so `go test -race` does not need cgo.
 
-Apply uses `DB.Std()` (the raw pool), so an applied row is not captured again. Each applier also ignores events whose origin is its own. Both directions can run on one stream without an echo loop.
-
-`modernc.org/sqlite` is the SQLite driver because it is pure Go: `go test -race` does not need cgo. `mattn/go-sqlite3` is cgo and fights the race detector. `Open` appends `_busy_timeout=5000` and `_journal_mode=WAL` to a SQLite DSN that does not already set them, so the relay and the applier can share the file.
-
-## Usage
-
-```go
-db, err := cdc.Open(ctx, cdc.Config{
-    Driver:  cdc.DriverPostgres,
-    DSN:     dsn,
-    Origin:  "postgres",
-    Subject: "cdc.events",
-    Tables:  []cdc.Table{{Name: "items", Key: []string{"id"}}},
-})
-if err != nil {
-    return err
-}
-defer db.Close()
-
-if err := cdc.EnsureStream(ctx, js, "CDC", "cdc.events"); err != nil {
-    return err
-}
-go db.Relay(ctx, js)
-
-tx, err := db.BeginTx(ctx, nil)
-if err != nil {
-    return err
-}
-if _, err := tx.ExecContext(ctx, `INSERT INTO items (id, name) VALUES ($1, $2)`, 1, "a"); err != nil {
-    tx.Rollback()
-    return err
-}
-if err := tx.Commit(); err != nil {
-    return err
-}
-```
-
-SQLite statements use `?`. The applier rewrites placeholders and identifier quoting for the target.
+## Wiring both directions
 
 ```go
-ap, err := cdc.NewApplier(cdc.ApplyConfig{
-    JS: js, Stream: "CDC", Subject: "cdc.events",
-    Durable: "apply-on-sqlite", Target: sqlite.Std(),
-    Driver: cdc.DriverSQLite, SkipOrigin: "sqlite",
+pg, err := capture.Open(ctx, postgres.Dialect{}, capture.Config{
+    DSN: dsn, Origin: "postgres",
+    Tables: []capture.Table{{Name: "items", Key: []string{"id"}}},
 })
-go ap.Run(ctx)
+lite, err := capture.Open(ctx, sqlite.Dialect{}, capture.Config{
+    DSN: liteDSN, Origin: "sqlite",
+    Tables: []capture.Table{{Name: "items", Key: []string{"id"}}},
+})
+pgStore, err := data.Open(ctx, pg.Std(), postgres.Dialect{})
+liteStore, err := data.Open(ctx, lite.Std(), sqlite.Dialect{})
+
+err = jetstream.EnsureStream(ctx, js, "CDC", "cdc.events")
+go jetstream.Publish(ctx, js, "cdc.events", pg)
+go jetstream.Publish(ctx, js, "cdc.events", lite)
+go jetstream.Consume(ctx, js, jetstream.ConsumeConfig{
+    Stream: "CDC", Subject: "cdc.events", Durable: "apply-on-sqlite", SkipOrigin: "sqlite",
+}, liteStore)
+go jetstream.Consume(ctx, js, jetstream.ConsumeConfig{
+    Stream: "CDC", Subject: "cdc.events", Durable: "apply-on-postgres", SkipOrigin: "postgres",
+}, pgStore)
 ```
 
-Create the table on both sides yourself. Writes through `Std` are not replicated; use that for DDL.
+Create the table on both sides yourself. Writes through `Std` are not captured; use that for DDL. Apply uses `Std` as well, so an applied row is not published again. Each consumer also ignores its own origin.
+
+```go
+tx, err := pg.BeginTx(ctx, nil)
+_, err = tx.ExecContext(ctx, `INSERT INTO items (id, name) VALUES ($1, $2)`, 1, "a")
+err = tx.Commit()
+```
+
+SQLite statements use `?`. The applier rewrites placeholders. An update or delete is captured only when it changes exactly one row. Zero rows publishes nothing. More than one row returns `capture.ErrMultipleRows`; the caller decides whether to roll back.
 
 ## Statements that are captured
 
@@ -71,17 +60,23 @@ UPDATE items SET name = $1 WHERE id = $2
 DELETE FROM items WHERE id = $1
 ```
 
-`WHERE` must be equality on the primary key, combined with `AND` when the key has more than one column. Identifiers are unquoted and stored lowercase. A statement outside this subset fails the write and changes nothing.
+`WHERE` must be equality on the primary key, combined with `AND` when the key has more than one column. Identifiers are stored lowercase. A statement outside this subset fails the write.
+
+## Adding an engine
+
+Engine-specific behavior sits on `data.Dialect`: driver name, placeholders, identifier quoting, upsert SQL (Postgres and SQLite share `data.Upsert`), outbox DDL, applied-sequence DDL, DSN defaults, pool setup, retryable errors, and non-primary-key unique conflicts. Adding an engine is a new package next to `data/postgres` that implements `Dialect` and blank-imports its `database/sql` driver. Capture, publish, and consume stay as they are. See issue #8.
 
 ## Limits
 
-- No snapshot of rows that already exist. Only later commits through `DB` are replicated.
-- No DDL, multi-row `INSERT`/`UPDATE`/`DELETE`, joins, `RETURNING`, expressions, or primary-key changes.
+- No snapshot of rows that already exist. Only later commits through `capture.DB` are replicated.
+- No DDL, multi-row writes, joins, `RETURNING`, expressions, or primary-key changes.
 - No `sql.Named` arguments and no prepared statements.
-- Text values must be valid UTF-8 (the event is JSON). `time.Time` is stored as UTC.
-- The JetStream duplicate window is two minutes. A republish after that is a second message; applying it still converges because apply is idempotent.
-- One relay per database is enough. Ordered apply uses `MaxAckPending: 1`.
-- The stream is a trust boundary for the data: a publisher can submit deletes, but identifiers are checked against `[A-Za-z_][A-Za-z0-9_]*` and values are bound parameters, so a message cannot break out of the statement.
+- Text values must be valid UTF-8. `time.Time` is stored as UTC.
+- JetStream's duplicate window here is two minutes, which is the window this stream is configured with, not a server maximum. A republish after that window is a second message. Apply drops it when its sequence is older than the last applied change for that origin, table, and key.
+- A unique violation that is not the primary key is a conflict: the message is terminated and logged, and later changes still apply. The row is not written.
+- An update that matches nothing is upserted when the after-image includes the key. Otherwise the message is terminated and logged. The consumer does not stop.
+- One publisher per capture is enough. Consumers use `MaxAckPending: 1`.
+- The stream is a trust boundary for the data: a publisher can submit deletes, but identifiers are checked and values are bound parameters.
 - SQLite must be a file database. A memory DSN would give each pooled connection its own empty database.
 
-Not built: metrics, a CLI, logical decoding, and conflict handling other than ordered idempotent apply.
+Not built: metrics, a CLI, logical decoding, and conflict handling beyond the sequence check and terminating non-primary-key unique violations.

@@ -1,4 +1,4 @@
-package cdc_test
+package jetstream_test
 
 import (
 	"testing"
