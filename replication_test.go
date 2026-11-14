@@ -1,61 +1,65 @@
 package cdc_test
 
-import "testing"
+import (
+	"testing"
 
-func TestUnsupportedSQLIsRejected(t *testing.T) {
-	Given(APostgresDatabase(t)).
-		And(AJetStream(t)).
-		When(AnUnsupportedWriteIsAttempted(t)).
-		Then(TheWriteIsRejectedAndNothingIsStored(t))
+	"github.com/stretchr/testify/suite"
+)
+
+func TestReplication(t *testing.T) {
+	suite.Run(t, new(ReplicationSuite))
 }
 
-func TestPostgresCommitReplicatesToSQLite(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		When(PostgresCommitsInsertAndUpdate(t)).
-		Then(SQLiteShowsTheCommittedPostgresRows(t)).
-		And(TheStreamHasOnlyTheCommittedPostgresChanges(t))
+func (s *ReplicationSuite) TestUnsupportedSQLIsRejected() {
+	s.When(s.AnUnsupportedWriteIsAttempted).
+		Then(s.TheWriteIsRejectedAndNothingIsStored)
 }
 
-func TestRolledBackDeleteIsNotReplicated(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		And(BothSidesShowTheCommittedPair(t)).
-		When(PostgresRollsBackADelete(t)).
-		Then(SQLiteShowsTheCommittedPostgresRows(t)).
-		And(TheStreamHasOnlyTheCommittedPostgresChanges(t))
+func (s *ReplicationSuite) TestPostgresCommitReplicatesToSQLite() {
+	s.Given(s.ReplicationRunningBothWays).
+		When(s.PostgresCommitsInsertAndUpdate).
+		Then(s.SQLiteShowsTheCommittedPostgresRows).
+		And(s.TheStreamHasOnlyTheCommittedPostgresChanges)
 }
 
-func TestDuplicateMessageIDDoesNotGrowTheStream(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		And(AnInsertHasBeenPublished(t)).
-		When(TheFirstEventIsRepublishedWithTheSameMsgID(t)).
-		Then(TheStreamDoesNotGrow(t))
+func (s *ReplicationSuite) TestRolledBackDeleteIsNotReplicated() {
+	s.Given(s.ReplicationRunningBothWays).
+		And(s.BothSidesShowTheCommittedPair).
+		When(s.PostgresRollsBackADelete).
+		Then(s.SQLiteShowsTheCommittedPostgresRows).
+		And(s.TheStreamHasOnlyTheCommittedPostgresChanges)
 }
 
-func TestPostgresDeleteReplicatesToSQLite(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		And(BothSidesShowTheCommittedPair(t)).
-		When(PostgresCommitsADelete(t)).
-		Then(SQLiteNoLongerHasTheDeletedRow(t))
+func (s *ReplicationSuite) TestDuplicateMessageIDDoesNotGrowTheStream() {
+	s.Given(s.ReplicationRunningBothWays).
+		And(s.AnInsertHasBeenPublished).
+		When(s.TheFirstEventIsRepublishedWithTheSameMsgID).
+		Then(s.TheStreamDoesNotGrow)
 }
 
-func TestReplayingTheStreamRestoresSQLite(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		And(BothSidesShowTheRowLeftAfterADelete(t)).
-		When(SQLiteIsWipedAndTheStreamIsReplayed(t)).
-		Then(SQLiteMatchesTheCommittedPostgresState(t))
+func (s *ReplicationSuite) TestPostgresDeleteReplicatesToSQLite() {
+	s.Given(s.ReplicationRunningBothWays).
+		And(s.BothSidesShowTheCommittedPair).
+		When(s.PostgresCommitsADelete).
+		Then(s.SQLiteNoLongerHasTheDeletedRow)
 }
 
-func TestSQLiteCommitReplicatesToPostgres(t *testing.T) {
-	Given(AReplicatingPair(t)).
-		And(BothSidesShowTheRowLeftAfterADelete(t)).
-		When(SQLiteCommitsAnUpdateAndInsert(t)).
-		Then(PostgresShowsTheSQLiteChanges(t)).
-		And(NoEchoWasPublished(t))
+func (s *ReplicationSuite) TestReplayingTheStreamRestoresSQLite() {
+	s.Given(s.ReplicationRunningBothWays).
+		And(s.BothSidesShowTheRowLeftAfterADelete).
+		When(s.SQLiteIsWipedAndTheStreamIsReplayed).
+		Then(s.SQLiteMatchesTheCommittedPostgresState)
 }
 
-func TestApplierRejectsMaliciousIdentifier(t *testing.T) {
-	Given(ASQLiteDatabase(t)).
-		And(AJetStream(t)).
-		When(AMaliciousEventIsPublished(t)).
-		Then(TheApplierStopsAndTheTableRemains(t))
+func (s *ReplicationSuite) TestSQLiteCommitReplicatesToPostgres() {
+	s.Given(s.ReplicationRunningBothWays).
+		And(s.BothSidesShowTheRowLeftAfterADelete).
+		When(s.SQLiteCommitsAnUpdateAndInsert).
+		Then(s.PostgresShowsTheSQLiteChanges).
+		And(s.NoEchoWasPublished)
+}
+
+func (s *ReplicationSuite) TestApplierRejectsMaliciousIdentifier() {
+	s.When(s.AMaliciousEventIsPublished).
+		Then(s.TheApplierStopsAndTheTableRemains)
 }
