@@ -41,13 +41,13 @@ type Applier struct {
 
 func NewApplier(cfg ApplyConfig) (*Applier, error) {
 	if cfg.JS == nil || cfg.Target == nil {
-		return nil, errors.New("cdc: applier requires jetstream and a target pool")
+		return nil, ErrApplierTarget
 	}
 	if cfg.Stream == "" || cfg.Subject == "" || cfg.Durable == "" || cfg.SkipOrigin == "" {
-		return nil, errors.New("cdc: applier requires stream, subject, durable, and skip origin")
+		return nil, ErrApplierConfig
 	}
 	if cfg.Driver != DriverPostgres && cfg.Driver != DriverSQLite {
-		return nil, fmt.Errorf("cdc: unsupported driver %q", cfg.Driver)
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedDriver, cfg.Driver)
 	}
 	return &Applier{
 		js:         cfg.JS,
@@ -120,7 +120,7 @@ func (a *Applier) Run(ctx context.Context) error {
 func (a *Applier) handle(ctx context.Context, msg jetstream.Msg) error {
 	var ev Event
 	if err := json.Unmarshal(msg.Data(), &ev); err != nil {
-		return permanent(fmt.Errorf("cdc: decode event: %w", err))
+		return permanent(fmt.Errorf("%w: %w", ErrDecodeEvent, err))
 	}
 	if err := ev.validate(); err != nil {
 		return permanent(err)
@@ -144,10 +144,10 @@ func (a *Applier) handle(ctx context.Context, msg jetstream.Msg) error {
 		return permanent(err)
 	}
 	if n == 0 {
-		return permanent(fmt.Errorf("cdc: update %s matched no rows", ev.Table))
+		return permanent(fmt.Errorf("%w: %s", ErrUpdateNoRows, ev.Table))
 	}
 	if n > 1 {
-		return permanent(fmt.Errorf("cdc: update %s matched %d rows", ev.Table, n))
+		return permanent(fmt.Errorf("%w: %s matched %d", ErrUpdateManyRows, ev.Table, n))
 	}
 	return nil
 }
@@ -161,7 +161,7 @@ func (a *Applier) exec(ctx context.Context, query string, args []any) (sql.Resul
 		}
 		last = err
 		if !isBusy(err) {
-			return nil, permanent(fmt.Errorf("cdc: apply %s: %w", query, err))
+			return nil, permanent(fmt.Errorf("%w: %s: %w", ErrApply, query, err))
 		}
 		select {
 		case <-ctx.Done():
@@ -174,21 +174,21 @@ func (a *Applier) exec(ctx context.Context, query string, args []any) (sql.Resul
 
 func (ev Event) validate() error {
 	if ev.MsgID == "" || ev.Origin == "" {
-		return errors.New("cdc: event missing id or origin")
+		return ErrEventIdentity
 	}
 	switch ev.Op {
 	case OpInsert, OpUpdate, OpDelete:
 	default:
-		return fmt.Errorf("cdc: unknown op %q", ev.Op)
+		return fmt.Errorf("%w: %q", ErrUnsupportedOp, ev.Op)
 	}
 	if _, err := quoteIdent(ev.Table); err != nil {
 		return err
 	}
 	if ev.Table == outboxTable {
-		return errors.New("cdc: refusing to apply cdc_outbox")
+		return ErrApplyOutbox
 	}
 	if len(ev.Key) == 0 {
-		return errors.New("cdc: event missing key")
+		return ErrEventKey
 	}
 	seenKey := make(map[string]bool, len(ev.Key))
 	for _, f := range ev.Key {
@@ -198,12 +198,12 @@ func (ev Event) validate() error {
 	}
 	if ev.Op == OpDelete {
 		if len(ev.After) != 0 {
-			return errors.New("cdc: delete event has an after-image")
+			return ErrDeleteAfter
 		}
 		return nil
 	}
 	if len(ev.After) == 0 {
-		return errors.New("cdc: event missing after-image")
+		return ErrMissingAfter
 	}
 	seenAfter := make(map[string]bool, len(ev.After))
 	for _, f := range ev.After {
@@ -215,13 +215,13 @@ func (ev Event) validate() error {
 	case OpInsert:
 		for _, k := range ev.Key {
 			if !seenAfter[k.Name] {
-				return fmt.Errorf("cdc: insert missing key column %s", k.Name)
+				return fmt.Errorf("%w: %s", ErrMissingKeyColumn, k.Name)
 			}
 		}
 	case OpUpdate:
 		for _, f := range ev.After {
 			if seenKey[f.Name] {
-				return errors.New("cdc: primary key updates are unsupported")
+				return ErrPrimaryKeyUpdate
 			}
 		}
 	}
@@ -233,7 +233,7 @@ func checkField(f Field, seen map[string]bool) error {
 		return err
 	}
 	if seen[f.Name] {
-		return fmt.Errorf("cdc: duplicate column %q", f.Name)
+		return fmt.Errorf("%w: %q", ErrDuplicateColumn, f.Name)
 	}
 	seen[f.Name] = true
 	if _, err := f.Value.bind(); err != nil {
@@ -255,7 +255,7 @@ func buildApply(driver string, ev Event) (string, []any, error) {
 	case OpDelete:
 		return buildDelete(driver, table, ev)
 	default:
-		return "", nil, fmt.Errorf("cdc: unknown op %q", ev.Op)
+		return "", nil, fmt.Errorf("%w: %q", ErrUnsupportedOp, ev.Op)
 	}
 }
 
@@ -370,7 +370,7 @@ var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func quoteIdent(name string) (string, error) {
 	if !identRe.MatchString(name) {
-		return "", fmt.Errorf("cdc: invalid identifier %q", name)
+		return "", fmt.Errorf("%w: %q", ErrInvalidIdentifier, name)
 	}
 	return `"` + name + `"`, nil
 }
@@ -404,6 +404,8 @@ func isBusy(err error) bool {
 
 type permanentError struct{ error }
 
+func (e permanentError) Unwrap() error { return e.error }
+
 func permanent(err error) error {
 	if err == nil {
 		return nil
@@ -415,10 +417,10 @@ func permanent(err error) error {
 // shortcut: the duplicate window is two minutes (the server default maximum). Redelivery after that still converges because apply is idempotent.
 func EnsureStream(ctx context.Context, js jetstream.JetStream, name, subject string) error {
 	if js == nil {
-		return errors.New("cdc: nil jetstream")
+		return ErrNilJetStream
 	}
 	if name == "" || subject == "" {
-		return errors.New("cdc: stream name and subject are required")
+		return ErrStreamRequired
 	}
 	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:       name,

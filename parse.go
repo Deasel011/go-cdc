@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -38,7 +37,7 @@ func parseDML(sqlText string, args []any) (parsed, error) {
 		return parsed{}, err
 	}
 	if kw.kind != tokKeyword {
-		return parsed{}, errors.New("cdc: unsupported statement")
+		return parsed{}, ErrUnsupportedStatement
 	}
 	var stmt parsed
 	switch kw.text {
@@ -49,7 +48,7 @@ func parseDML(sqlText string, args []any) (parsed, error) {
 	case "delete":
 		stmt, err = p.parseDelete()
 	default:
-		return parsed{}, errors.New("cdc: unsupported statement")
+		return parsed{}, ErrUnsupportedStatement
 	}
 	if err != nil {
 		return parsed{}, err
@@ -58,7 +57,7 @@ func parseDML(sqlText string, args []any) (parsed, error) {
 		return parsed{}, err
 	}
 	if stmt.table == outboxTable {
-		return parsed{}, errors.New("cdc: writes to cdc_outbox are not captured")
+		return parsed{}, ErrCaptureOutbox
 	}
 	if err := stmt.bind(args); err != nil {
 		return parsed{}, err
@@ -84,16 +83,16 @@ func bindArgs(args []any, nums []int) ([]Value, error) {
 	maxn := 0
 	for _, n := range nums {
 		if n < 1 {
-			return nil, fmt.Errorf("cdc: invalid placeholder %d", n)
+			return nil, fmt.Errorf("%w: %d", ErrInvalidPlaceholder, n)
 		}
 		if seen[n] {
-			return nil, fmt.Errorf("cdc: placeholder $%d reused", n)
+			return nil, fmt.Errorf("%w: $%d", ErrPlaceholderReused, n)
 		}
 		seen[n] = true
 		maxn = max(maxn, n)
 	}
 	if len(args) != maxn || len(seen) != len(args) {
-		return nil, errors.New("cdc: placeholders must use each argument once")
+		return nil, ErrPlaceholderArity
 	}
 	out := make([]Value, len(nums))
 	for i, n := range nums {
@@ -109,11 +108,11 @@ func bindArgs(args []any, nums []int) ([]Value, error) {
 func encodeValue(v any) (Value, error) {
 	if _, ok := v.(sql.NamedArg); ok {
 		// shortcut: sql.Named arguments are unsupported; pass positional args.
-		return Value{}, errors.New("cdc: sql.Named arguments are unsupported")
+		return Value{}, ErrNamedArg
 	}
 	dv, err := driver.DefaultParameterConverter.ConvertValue(v)
 	if err != nil {
-		return Value{}, fmt.Errorf("cdc: %w", err)
+		return Value{}, fmt.Errorf("%w: %w", ErrUnsupportedValue, err)
 	}
 	switch x := dv.(type) {
 	case nil:
@@ -122,7 +121,7 @@ func encodeValue(v any) (Value, error) {
 		return Value{Type: "int", Data: strconv.FormatInt(x, 10)}, nil
 	case float64:
 		if math.IsNaN(x) || math.IsInf(x, 0) {
-			return Value{}, errors.New("cdc: non-finite float")
+			return Value{}, ErrNonFiniteFloat
 		}
 		return Value{Type: "float", Data: strconv.FormatFloat(x, 'g', -1, 64)}, nil
 	case bool:
@@ -137,7 +136,7 @@ func encodeValue(v any) (Value, error) {
 	case time.Time:
 		return Value{Type: "time", Data: x.UTC().Format(time.RFC3339Nano)}, nil
 	default:
-		return Value{}, fmt.Errorf("cdc: unsupported value type %T", dv)
+		return Value{}, fmt.Errorf("%w: %T", ErrUnsupportedValue, dv)
 	}
 }
 
@@ -145,25 +144,25 @@ func (v Value) bind() (any, error) {
 	switch v.Type {
 	case "null":
 		if v.Data != "" {
-			return nil, errors.New("cdc: null value has data")
+			return nil, ErrNullData
 		}
 		return nil, nil
 	case "int":
 		n, err := strconv.ParseInt(v.Data, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("cdc: int value: %w", err)
+			return nil, fmt.Errorf("%w: int: %w", ErrBadValue, err)
 		}
 		return n, nil
 	case "float":
 		n, err := strconv.ParseFloat(v.Data, 64)
 		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
-			return nil, fmt.Errorf("cdc: float value %q", v.Data)
+			return nil, fmt.Errorf("%w: float %q", ErrBadValue, v.Data)
 		}
 		return n, nil
 	case "bool":
 		n, err := strconv.ParseBool(v.Data)
 		if err != nil {
-			return nil, fmt.Errorf("cdc: bool value: %w", err)
+			return nil, fmt.Errorf("%w: bool: %w", ErrBadValue, err)
 		}
 		return n, nil
 	case "string":
@@ -171,17 +170,17 @@ func (v Value) bind() (any, error) {
 	case "bytes":
 		b, err := base64.StdEncoding.DecodeString(v.Data)
 		if err != nil {
-			return nil, fmt.Errorf("cdc: bytes value: %w", err)
+			return nil, fmt.Errorf("%w: bytes: %w", ErrBadValue, err)
 		}
 		return b, nil
 	case "time":
 		t, err := time.Parse(time.RFC3339Nano, v.Data)
 		if err != nil {
-			return nil, fmt.Errorf("cdc: time value: %w", err)
+			return nil, fmt.Errorf("%w: time: %w", ErrBadValue, err)
 		}
 		return t, nil
 	default:
-		return nil, fmt.Errorf("cdc: unknown value type %q", v.Type)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownValueType, v.Type)
 	}
 }
 
@@ -253,7 +252,7 @@ func tokenize(sqlText string) ([]token, error) {
 			i = next
 		default:
 			if !isIdentStart(sqlText[i]) {
-				return nil, fmt.Errorf("cdc: unsupported syntax at %q", sqlText[i:])
+				return nil, fmt.Errorf("%w: %q", ErrUnsupportedSyntax, sqlText[i:])
 			}
 			j := i + 1
 			for j < len(sqlText) && isIdentCont(sqlText[j]) {
@@ -269,10 +268,10 @@ func tokenize(sqlText string) ([]token, error) {
 		}
 	}
 	if dollar && sawQmark {
-		return nil, errors.New("cdc: mixed placeholder styles")
+		return nil, ErrMixedPlaceholders
 	}
 	if len(toks) == 0 {
-		return nil, errors.New("cdc: empty statement")
+		return nil, ErrEmptyStatement
 	}
 	return toks, nil
 }
@@ -280,7 +279,7 @@ func tokenize(sqlText string) ([]token, error) {
 func scanDollar(sqlText string, i int) (int, int, error) {
 	j := i + 1
 	if j >= len(sqlText) || sqlText[j] < '1' || sqlText[j] > '9' {
-		return 0, 0, errors.New("cdc: invalid placeholder")
+		return 0, 0, ErrInvalidPlaceholder
 	}
 	n := 0
 	for j < len(sqlText) && sqlText[j] >= '0' && sqlText[j] <= '9' {
@@ -288,7 +287,7 @@ func scanDollar(sqlText string, i int) (int, int, error) {
 		j++
 	}
 	if n < 1 {
-		return 0, 0, errors.New("cdc: invalid placeholder")
+		return 0, 0, ErrInvalidPlaceholder
 	}
 	return n, j, nil
 }
@@ -299,7 +298,7 @@ func scanQuoted(sqlText string, i int) (string, int, error) {
 		j++
 	}
 	if j >= len(sqlText) {
-		return "", 0, errors.New("cdc: unterminated identifier")
+		return "", 0, ErrUnterminatedIdent
 	}
 	name := strings.ToLower(sqlText[i+1 : j])
 	if _, err := quoteIdent(name); err != nil {
@@ -344,7 +343,7 @@ func (p *parser) peek() (token, bool) {
 func (p *parser) next() (token, error) {
 	t, ok := p.peek()
 	if !ok {
-		return token{}, errors.New("cdc: unexpected end of statement")
+		return token{}, ErrUnexpectedEnd
 	}
 	p.i++
 	return t, nil
@@ -356,7 +355,7 @@ func (p *parser) keyword(want string) error {
 		return err
 	}
 	if t.kind != tokKeyword || t.text != want {
-		return fmt.Errorf("cdc: expected %s", want)
+		return fmt.Errorf("%w: %s", ErrExpectedToken, want)
 	}
 	return nil
 }
@@ -367,7 +366,7 @@ func (p *parser) ident() (string, error) {
 		return "", err
 	}
 	if t.kind != tokIdent {
-		return "", errors.New("cdc: expected identifier")
+		return "", ErrExpectedToken
 	}
 	return t.text, nil
 }
@@ -378,7 +377,7 @@ func (p *parser) ph() (int, error) {
 		return 0, err
 	}
 	if t.kind != tokPlaceholder {
-		return 0, errors.New("cdc: expected placeholder")
+		return 0, ErrExpectedToken
 	}
 	return t.num, nil
 }
@@ -391,11 +390,11 @@ func (p *parser) end() error {
 	if t.kind == tokSemi {
 		p.i++
 		if _, ok := p.peek(); ok {
-			return errors.New("cdc: unexpected trailing tokens")
+			return ErrUnexpectedTrailing
 		}
 		return nil
 	}
-	return errors.New("cdc: unexpected trailing tokens")
+	return ErrUnexpectedTrailing
 }
 
 func (p *parser) parseInsert() (parsed, error) {
@@ -418,7 +417,7 @@ func (p *parser) parseInsert() (parsed, error) {
 		return parsed{}, err
 	}
 	if len(cols) != len(nums) {
-		return parsed{}, errors.New("cdc: column count does not match values")
+		return parsed{}, ErrColumnCount
 	}
 	return parsed{op: OpInsert, table: table, cols: cols, nums: nums}, nil
 }
@@ -478,7 +477,7 @@ func (p *parser) identList() ([]string, error) {
 		case tokComma:
 			continue
 		default:
-			return nil, errors.New("cdc: expected comma or closing parenthesis")
+			return nil, ErrExpectedToken
 		}
 	}
 }
@@ -504,7 +503,7 @@ func (p *parser) numList() ([]int, error) {
 		case tokComma:
 			continue
 		default:
-			return nil, errors.New("cdc: expected comma or closing parenthesis")
+			return nil, ErrExpectedToken
 		}
 	}
 }
@@ -568,7 +567,7 @@ func (p *parser) expect(kind tokKind) (token, error) {
 		return token{}, err
 	}
 	if t.kind != kind {
-		return token{}, errors.New("cdc: unexpected token")
+		return token{}, ErrExpectedToken
 	}
 	return t, nil
 }

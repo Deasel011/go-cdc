@@ -283,7 +283,7 @@ func (s *ReplicationSuite) AnUnsupportedWriteIsAttempted() {
 }
 
 func (s *ReplicationSuite) TheWriteIsRejectedAndNothingIsStored() {
-	s.Require().Error(s.rejected)
+	s.Require().ErrorIs(s.rejected, cdc.ErrUnsupportedSyntax)
 	var n int64
 	s.Require().NoError(s.pg.QueryRowContext(s.T().Context(), `SELECT COUNT(*) FROM items`).Scan(&n))
 	s.Require().Zero(n)
@@ -442,7 +442,7 @@ func (s *ReplicationSuite) TheApplierStopsAndTheTableRemains() {
 	ctx, cancel := context.WithTimeout(s.T().Context(), 20*time.Second)
 	defer cancel()
 	err = ap.Run(ctx)
-	s.Require().ErrorContains(err, "invalid identifier")
+	s.Require().ErrorIs(err, cdc.ErrInvalidIdentifier)
 	var name string
 	s.Require().NoError(s.lite.QueryRowContext(s.T().Context(), `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'items'`).Scan(&name))
 	s.Require().Equal("items", name)

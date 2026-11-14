@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -101,13 +100,13 @@ func Open(ctx context.Context, cfg Config) (*DB, error) {
 		return nil, err
 	}
 	if cfg.Subject == "" {
-		return nil, errors.New("cdc: subject is required")
+		return nil, ErrSubjectRequired
 	}
 	if cfg.DSN == "" {
-		return nil, errors.New("cdc: dsn is required")
+		return nil, ErrDSNRequired
 	}
 	if cfg.Driver != DriverPostgres && cfg.Driver != DriverSQLite {
-		return nil, fmt.Errorf("cdc: unsupported driver %q", cfg.Driver)
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedDriver, cfg.Driver)
 	}
 	tables, err := normalizeTables(cfg.Tables)
 	if err != nil {
@@ -211,7 +210,7 @@ func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *s
 // Commit succeeds, so a rollback leaves the stream alone.
 func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if tx.done {
-		return nil, errors.New("cdc: transaction finished")
+		return nil, ErrTransactionFinished
 	}
 	parsed, err := parseDML(query, args)
 	if err != nil {
@@ -234,7 +233,7 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 // retried and a failed commit publishes nothing.
 func (tx *Tx) Commit() error {
 	if tx.done {
-		return sql.ErrTxDone
+		return ErrTransactionFinished
 	}
 	for _, ch := range tx.changes {
 		id, err := newMsgID(tx.db.origin)
@@ -301,7 +300,7 @@ func (db *DB) signal() {
 // shortcut: polls the outbox; use one relay per database. A second relay is safe inside the duplicate window.
 func (db *DB) Relay(ctx context.Context, js jetstream.JetStream) error {
 	if js == nil {
-		return errors.New("cdc: nil jetstream")
+		return ErrNilJetStream
 	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
@@ -386,7 +385,7 @@ func (db *DB) createOutbox(ctx context.Context) error {
 			"payload" BLOB NOT NULL
 		)`
 	default:
-		return fmt.Errorf("cdc: unsupported driver %q", db.driver)
+		return fmt.Errorf("%w: %q", ErrUnsupportedDriver, db.driver)
 	}
 	_, err := db.sql.ExecContext(ctx, ddl)
 	return err
@@ -395,7 +394,7 @@ func (db *DB) createOutbox(ctx context.Context) error {
 func (db *DB) capture(p parsed) (change, error) {
 	meta, ok := db.tables[p.table]
 	if !ok {
-		return change{}, fmt.Errorf("cdc: table %q is not registered", p.table)
+		return change{}, fmt.Errorf("%w: %q", ErrTableNotRegistered, p.table)
 	}
 	switch p.op {
 	case OpInsert:
@@ -409,19 +408,19 @@ func (db *DB) capture(p parsed) (change, error) {
 		}
 		return change{op: OpDelete, table: meta.name, key: key}, nil
 	default:
-		return change{}, fmt.Errorf("cdc: unsupported op %q", p.op)
+		return change{}, fmt.Errorf("%w: %q", ErrUnsupportedOp, p.op)
 	}
 }
 
 func captureInsert(meta tableMeta, p parsed) (change, error) {
 	if len(p.cols) == 0 {
-		return change{}, errors.New("cdc: insert has no columns")
+		return change{}, ErrNoColumns
 	}
 	got := make(map[string]Value, len(p.cols))
 	after := make([]Field, 0, len(p.cols))
 	for i, col := range p.cols {
 		if _, dup := got[col]; dup {
-			return change{}, fmt.Errorf("cdc: duplicate column %q", col)
+			return change{}, fmt.Errorf("%w: %q", ErrDuplicateColumn, col)
 		}
 		got[col] = p.colVals[i]
 		after = append(after, Field{Name: col, Value: p.colVals[i]})
@@ -430,7 +429,7 @@ func captureInsert(meta tableMeta, p parsed) (change, error) {
 	for _, k := range meta.key {
 		v, ok := got[k]
 		if !ok {
-			return change{}, fmt.Errorf("cdc: table %q: insert must include primary key column %s", meta.name, k)
+			return change{}, fmt.Errorf("%w: %q.%s", ErrMissingKeyColumn, meta.name, k)
 		}
 		key = append(key, Field{Name: k, Value: v})
 	}
@@ -439,7 +438,7 @@ func captureInsert(meta tableMeta, p parsed) (change, error) {
 
 func captureUpdate(meta tableMeta, p parsed) (change, error) {
 	if len(p.cols) == 0 {
-		return change{}, errors.New("cdc: update has no columns")
+		return change{}, ErrNoColumns
 	}
 	key, err := keyFields(meta, p.where, p.whereVals)
 	if err != nil {
@@ -453,12 +452,12 @@ func captureUpdate(meta tableMeta, p parsed) (change, error) {
 	after := make([]Field, 0, len(p.cols))
 	for i, col := range p.cols {
 		if seen[col] {
-			return change{}, fmt.Errorf("cdc: duplicate column %q", col)
+			return change{}, fmt.Errorf("%w: %q", ErrDuplicateColumn, col)
 		}
 		seen[col] = true
 		// shortcut: primary-key updates are unsupported; the key is the identity apply matches on.
 		if keySet[col] {
-			return change{}, fmt.Errorf("cdc: primary key updates are unsupported")
+			return change{}, ErrPrimaryKeyUpdate
 		}
 		after = append(after, Field{Name: col, Value: p.colVals[i]})
 	}
@@ -467,23 +466,23 @@ func captureUpdate(meta tableMeta, p parsed) (change, error) {
 
 func keyFields(meta tableMeta, cols []string, vals []Value) ([]Field, error) {
 	if len(cols) != len(vals) {
-		return nil, errors.New("cdc: internal placeholder mismatch")
+		return nil, ErrPlaceholderMismatch
 	}
 	got := make(map[string]Value, len(cols))
 	for i, col := range cols {
 		if _, dup := got[col]; dup {
-			return nil, fmt.Errorf("cdc: duplicate column %q", col)
+			return nil, fmt.Errorf("%w: %q", ErrDuplicateColumn, col)
 		}
 		got[col] = vals[i]
 	}
 	if len(got) != len(meta.key) {
-		return nil, fmt.Errorf("cdc: table %q: WHERE must be the primary key (%s)", meta.name, strings.Join(meta.key, ", "))
+		return nil, fmt.Errorf("%w: %q (%s)", ErrWhereNotPrimaryKey, meta.name, strings.Join(meta.key, ", "))
 	}
 	out := make([]Field, 0, len(meta.key))
 	for _, k := range meta.key {
 		v, ok := got[k]
 		if !ok {
-			return nil, fmt.Errorf("cdc: table %q: WHERE must be the primary key (%s)", meta.name, strings.Join(meta.key, ", "))
+			return nil, fmt.Errorf("%w: %q (%s)", ErrWhereNotPrimaryKey, meta.name, strings.Join(meta.key, ", "))
 		}
 		out = append(out, Field{Name: k, Value: v})
 	}
@@ -494,14 +493,14 @@ var originRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,62}$`)
 
 func validateOrigin(origin string) error {
 	if !originRe.MatchString(origin) {
-		return fmt.Errorf("cdc: invalid origin %q", origin)
+		return fmt.Errorf("%w: %q", ErrInvalidOrigin, origin)
 	}
 	return nil
 }
 
 func normalizeTables(tables []Table) (map[string]tableMeta, error) {
 	if len(tables) == 0 {
-		return nil, errors.New("cdc: at least one table is required")
+		return nil, ErrNoTables
 	}
 	out := make(map[string]tableMeta, len(tables))
 	for _, table := range tables {
@@ -510,10 +509,10 @@ func normalizeTables(tables []Table) (map[string]tableMeta, error) {
 			return nil, err
 		}
 		if name == outboxTable {
-			return nil, errors.New("cdc: cdc_outbox cannot be registered")
+			return nil, ErrOutboxTable
 		}
 		if len(table.Key) == 0 {
-			return nil, fmt.Errorf("cdc: table %q: primary key is required", name)
+			return nil, fmt.Errorf("%w: %q", ErrPrimaryKeyRequired, name)
 		}
 		key := make([]string, len(table.Key))
 		seen := make(map[string]bool, len(table.Key))
@@ -523,13 +522,13 @@ func normalizeTables(tables []Table) (map[string]tableMeta, error) {
 				return nil, err
 			}
 			if seen[col] {
-				return nil, fmt.Errorf("cdc: table %q: duplicate key column %q", name, col)
+				return nil, fmt.Errorf("%w: %q.%q", ErrDuplicateKeyColumn, name, col)
 			}
 			seen[col] = true
 			key[i] = col
 		}
 		if _, dup := out[name]; dup {
-			return nil, fmt.Errorf("cdc: table %q registered twice", name)
+			return nil, fmt.Errorf("%w: %q", ErrDuplicateTable, name)
 		}
 		out[name] = tableMeta{name: name, key: key}
 	}
@@ -541,7 +540,7 @@ func sqliteDSN(dsn string) (string, error) {
 	// Each connection to a memory database is empty, so the pool would not
 	// share the outbox with the caller.
 	if strings.Contains(lower, ":memory:") || strings.Contains(lower, "mode=memory") {
-		return "", errors.New("cdc: sqlite DSN must be a file database so the pool shares one database")
+		return "", ErrMemoryDSN
 	}
 	if !strings.Contains(dsn, "_busy_timeout=") && !strings.Contains(dsn, "_timeout=") {
 		dsn = appendQuery(dsn, "_busy_timeout=5000")
@@ -580,7 +579,7 @@ func (r capturedResult) RowsAffected() (int64, error) { return r.n, r.nErr }
 func snapshotResult(res sql.Result) sql.Result {
 	out := capturedResult{}
 	if res == nil {
-		out.nErr = errors.New("cdc: nil result")
+		out.nErr = ErrNilResult
 		out.idErr = out.nErr
 		return out
 	}
