@@ -241,6 +241,39 @@ func AJetStream(t *testing.T) Step {
 	}
 }
 
+func AReplicatingPair(t *testing.T) Step {
+	return func(s *Suite) {
+		APostgresDatabase(t)(s)
+		ASQLiteDatabase(t)(s)
+		AJetStream(t)(s)
+		ReplicationRunningBothWays(t)(s)
+	}
+}
+
+func AnInsertHasBeenPublished(t *testing.T) Step {
+	return func(s *Suite) {
+		if _, err := s.pg.ExecContext(t.Context(), `INSERT INTO items (id, name, qty, note) VALUES ($1, $2, $3, $4)`, wideID, "widget", 1, nastyNote); err != nil {
+			t.Fatal(err)
+		}
+		s.waitOutbox(s.pg)
+	}
+}
+
+func BothSidesShowTheCommittedPair(t *testing.T) Step {
+	return func(s *Suite) {
+		PostgresCommitsInsertAndUpdate(t)(s)
+		s.waitBoth(committedPair())
+	}
+}
+
+func BothSidesShowTheRowLeftAfterADelete(t *testing.T) Step {
+	return func(s *Suite) {
+		BothSidesShowTheCommittedPair(t)(s)
+		PostgresCommitsADelete(t)(s)
+		s.waitBoth(afterPostgresDelete())
+	}
+}
+
 func ReplicationRunningBothWays(t *testing.T) Step {
 	return func(s *Suite) {
 		s.t = t
@@ -349,7 +382,7 @@ func SQLiteShowsTheCommittedPostgresRows(t *testing.T) Step {
 	}
 }
 
-func TheRolledBackDeleteIsAbsentFromTheStream(t *testing.T) Step {
+func TheStreamHasOnlyTheCommittedPostgresChanges(t *testing.T) Step {
 	return func(s *Suite) {
 		s.checkBackground()
 		got := s.events()
@@ -360,9 +393,6 @@ func TheRolledBackDeleteIsAbsentFromTheStream(t *testing.T) Step {
 		for i, ev := range got {
 			if ev.Origin != "postgres" || ev.Op != want[i] {
 				t.Fatalf("event %d = %s %s, want postgres %s", i, ev.Origin, ev.Op, want[i])
-			}
-			if ev.Op == cdc.OpDelete {
-				t.Fatalf("rolled-back delete was published: %+v", ev)
 			}
 		}
 	}
