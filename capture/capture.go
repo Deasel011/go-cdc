@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Deasel011/go-cdc"
-	"github.com/Deasel011/go-cdc/capture/internal/sqlparse"
 	"github.com/Deasel011/go-cdc/data"
 )
 
@@ -162,33 +161,43 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	if done {
 		return nil, ErrTransactionFinished
 	}
-	stmt, err := sqlparse.Parse(query, args)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnsupportedStatement, err)
-	}
-	ch, err := tx.db.capture(stmt)
+	op, err := cdc.StatementOp(query)
 	if err != nil {
 		return nil, err
+	}
+	table, err := cdc.StatementTable(query)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := tx.db.tables[strings.ToLower(table)]; !ok {
+		return nil, fmt.Errorf("%w: %s", ErrTableNotRegistered, table)
+	}
+	encoded := make([]cdc.Value, len(args))
+	for i, arg := range args {
+		encoded[i], err = cdc.NewValue(arg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	res, err := tx.tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	snap := snapshotResult(res)
-	if stmt.Op == cdc.Update || stmt.Op == cdc.Delete {
-		n, err := snap.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			return snap, nil
-		}
-		if n > 1 {
-			return nil, fmt.Errorf("%w: %d", ErrMultipleRows, n)
-		}
+	n, err := snap.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	// A write that changed nothing is not a change. More than one row is
+	// ambiguous to replay; the caller decides whether to roll back.
+	if n == 0 {
+		return snap, nil
+	}
+	if n > 1 {
+		return nil, fmt.Errorf("%w: %d", ErrMultipleRows, n)
 	}
 	tx.mu.Lock()
-	tx.changes = append(tx.changes, ch)
+	tx.changes = append(tx.changes, cdc.Change{Op: op, SQL: query, Args: encoded})
 	tx.mu.Unlock()
 	return snap, nil
 }
@@ -345,107 +354,9 @@ func (db *DB) yieldBatch(ctx context.Context, yield func(cdc.Change, error) bool
 	return len(batch), nil
 }
 
-func (db *DB) capture(stmt sqlparse.Statement) (cdc.Change, error) {
-	meta, ok := db.tables[stmt.Table]
-	if !ok {
-		return cdc.Change{}, fmt.Errorf("%w: %q", ErrTableNotRegistered, stmt.Table)
-	}
-	switch stmt.Op {
-	case cdc.Insert:
-		return captureInsert(meta, stmt)
-	case cdc.Update:
-		return captureUpdate(meta, stmt)
-	case cdc.Delete:
-		key, err := keyFields(meta, stmt.Where, stmt.WhereVals)
-		if err != nil {
-			return cdc.Change{}, err
-		}
-		return cdc.Change{Op: cdc.Delete, Table: meta.name, Key: key}, nil
-	default:
-		return cdc.Change{}, fmt.Errorf("%w: %q", cdc.ErrUnsupportedOp, stmt.Op)
-	}
-}
-
-func captureInsert(meta tableMeta, stmt sqlparse.Statement) (cdc.Change, error) {
-	if len(stmt.Cols) == 0 {
-		return cdc.Change{}, ErrNoColumns
-	}
-	got := make(map[string]cdc.Value, len(stmt.Cols))
-	after := make([]cdc.Field, 0, len(stmt.Cols))
-	for i, col := range stmt.Cols {
-		if _, dup := got[col]; dup {
-			return cdc.Change{}, fmt.Errorf("%w: %q", cdc.ErrDuplicateColumn, col)
-		}
-		got[col] = stmt.ColVals[i]
-		after = append(after, cdc.Field{Name: col, Value: stmt.ColVals[i]})
-	}
-	key := make([]cdc.Field, 0, len(meta.key))
-	for _, k := range meta.key {
-		v, ok := got[k]
-		if !ok {
-			return cdc.Change{}, fmt.Errorf("%w: %s.%s", cdc.ErrMissingKeyColumn, meta.name, k)
-		}
-		key = append(key, cdc.Field{Name: k, Value: v})
-	}
-	return cdc.Change{Op: cdc.Insert, Table: meta.name, Key: key, After: after}, nil
-}
-
-func captureUpdate(meta tableMeta, stmt sqlparse.Statement) (cdc.Change, error) {
-	if len(stmt.Cols) == 0 {
-		return cdc.Change{}, ErrNoColumns
-	}
-	key, err := keyFields(meta, stmt.Where, stmt.WhereVals)
-	if err != nil {
-		return cdc.Change{}, err
-	}
-	keySet := make(map[string]bool, len(meta.key))
-	for _, k := range meta.key {
-		keySet[k] = true
-	}
-	seen := make(map[string]bool, len(stmt.Cols))
-	after := make([]cdc.Field, 0, len(stmt.Cols))
-	for i, col := range stmt.Cols {
-		if seen[col] {
-			return cdc.Change{}, fmt.Errorf("%w: %q", cdc.ErrDuplicateColumn, col)
-		}
-		seen[col] = true
-		if keySet[col] {
-			return cdc.Change{}, cdc.ErrPrimaryKeyUpdate
-		}
-		after = append(after, cdc.Field{Name: col, Value: stmt.ColVals[i]})
-	}
-	return cdc.Change{Op: cdc.Update, Table: meta.name, Key: key, After: after}, nil
-}
-
-func keyFields(meta tableMeta, cols []string, vals []cdc.Value) ([]cdc.Field, error) {
-	if len(cols) != len(vals) {
-		return nil, errPlaceholderMismatch
-	}
-	got := make(map[string]cdc.Value, len(cols))
-	for i, col := range cols {
-		if _, dup := got[col]; dup {
-			return nil, fmt.Errorf("%w: %q", cdc.ErrDuplicateColumn, col)
-		}
-		got[col] = vals[i]
-	}
-	if len(got) != len(meta.key) {
-		return nil, fmt.Errorf("%w: %q (%s)", ErrWhereNotPrimaryKey, meta.name, strings.Join(meta.key, ", "))
-	}
-	out := make([]cdc.Field, 0, len(meta.key))
-	for _, k := range meta.key {
-		v, ok := got[k]
-		if !ok {
-			return nil, fmt.Errorf("%w: %q (%s)", ErrWhereNotPrimaryKey, meta.name, strings.Join(meta.key, ", "))
-		}
-		out = append(out, cdc.Field{Name: k, Value: v})
-	}
-	return out, nil
-}
-
 const (
-	errPlaceholderMismatch captureError = "capture: internal placeholder mismatch"
-	errNilDialect          captureError = "capture: nil dialect"
-	errStop                captureError = "capture: stop"
+	errNilDialect captureError = "capture: nil dialect"
+	errStop       captureError = "capture: stop"
 )
 
 type captureError string

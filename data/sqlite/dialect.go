@@ -17,8 +17,6 @@ func (Dialect) Driver() string { return "sqlite" }
 
 func (Dialect) Placeholder(int) string { return "?" }
 
-func (Dialect) Quote(ident string) (string, error) { return data.QuoteIdent(ident) }
-
 func (Dialect) OutboxDDL() string {
 	return `CREATE TABLE IF NOT EXISTS "cdc_outbox" (
 		"id" INTEGER PRIMARY KEY AUTOINCREMENT,

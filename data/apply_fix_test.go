@@ -23,19 +23,6 @@ func TestStaleSequenceDoesNotOverwrite(t *testing.T) {
 	require.Equal(t, "new", name)
 }
 
-func TestUpdateMissingRowUpsertsWhenImageIsComplete(t *testing.T) {
-	store, db := openStore(t)
-	ctx := t.Context()
-	_, err := db.ExecContext(ctx, `CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
-	require.NoError(t, err)
-	ch := itemChange(1, cdc.Update, "full")
-	ch.After = append(ch.After, ch.Key...)
-	require.NoError(t, store.Apply(ctx, ch))
-	var name string
-	require.NoError(t, db.QueryRowContext(ctx, `SELECT name FROM items WHERE id = 1`).Scan(&name))
-	require.Equal(t, "full", name)
-}
-
 func TestUpdateMissingRowDoesNotStickWhenImageIsPartial(t *testing.T) {
 	store, db := openStore(t)
 	_, err := db.ExecContext(t.Context(), `CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
@@ -82,16 +69,15 @@ func namedChange(seq, id int64, name string, op ...cdc.Op) cdc.Change {
 		kind = op[0]
 	}
 	idVal := cdc.Value{Type: "int", Data: itoa(id)}
+	nameVal := cdc.Value{Type: "string", Data: name}
 	ch := cdc.Change{
-		ID: "t", Origin: "sqlite", Seq: seq, Op: kind, Table: "items",
-		Key: []cdc.Field{{Name: "id", Value: idVal}},
-		After: []cdc.Field{
-			{Name: "id", Value: idVal},
-			{Name: "name", Value: cdc.Value{Type: "string", Data: name}},
-		},
+		ID: "t", Origin: "sqlite", Seq: seq, Op: kind,
+		SQL:  `INSERT INTO items (id, name) VALUES (?, ?)`,
+		Args: []cdc.Value{idVal, nameVal},
 	}
 	if kind == cdc.Update {
-		ch.After = []cdc.Field{{Name: "name", Value: cdc.Value{Type: "string", Data: name}}}
+		ch.SQL = `UPDATE items SET name = ? WHERE id = ?`
+		ch.Args = []cdc.Value{nameVal, idVal}
 	}
 	return ch
 }

@@ -15,24 +15,18 @@ const (
 	Delete Op = "delete"
 )
 
-// Change is one committed row change. Seq is a per-origin monotonic
-// sequence (the source outbox id). Appliers drop a change whose Seq is
-// not newer than the last applied Seq for the same origin, table, and key,
-// so a redelivery after the JetStream dedup window cannot roll a row backward.
+// Change is one committed write. SQL and Args are the statement database/sql
+// already executed; apply replays them on the target. Seq is the source outbox
+// id. Appliers drop a change whose Seq is not newer than the last applied Seq
+// from that origin, so a redelivery after the JetStream dedup window cannot
+// roll a row backward.
 type Change struct {
 	ID     string  `json:"id"`
 	Origin string  `json:"origin"`
 	Seq    int64   `json:"seq"`
 	Op     Op      `json:"op"`
-	Table  string  `json:"table"`
-	Key    []Field `json:"key"`
-	After  []Field `json:"after,omitzero"`
-}
-
-// Field is one column in a key or an after-image.
-type Field struct {
-	Name  string `json:"name"`
-	Value Value  `json:"value"`
+	SQL    string  `json:"sql"`
+	Args   []Value `json:"args,omitzero"`
 }
 
 // Value is one bound parameter. Data is omitted for null.
@@ -63,96 +57,23 @@ func ValidIdent(name string) error {
 	return nil
 }
 
-// Validate checks the change before it is applied. Identifiers are restricted
-// to a letter or underscore followed by letters, digits, or underscores.
+// Validate checks the change before it is applied. The statement must be one
+// INSERT, UPDATE, or DELETE, and Op must name that statement.
 func (c Change) Validate() error {
 	if c.ID == "" || c.Origin == "" {
 		return ErrEventIdentity
 	}
-	switch c.Op {
-	case Insert, Update, Delete:
-	default:
+	op, err := StatementOp(c.SQL)
+	if err != nil {
+		return err
+	}
+	if c.Op != op {
 		return errWrap(ErrUnsupportedOp, string(c.Op))
 	}
-	if err := ValidIdent(c.Table); err != nil {
-		return err
-	}
-	if c.Table == "cdc_outbox" || c.Table == "cdc_applied" {
-		return ErrReservedTable
-	}
-	if len(c.Key) == 0 {
-		return ErrEventKey
-	}
-	seenKey := make(map[string]bool, len(c.Key))
-	for _, f := range c.Key {
-		if err := checkField(f, seenKey); err != nil {
+	for _, arg := range c.Args {
+		if _, err := arg.Bind(); err != nil {
 			return err
 		}
 	}
-	if c.Op == Delete {
-		if len(c.After) != 0 {
-			return ErrDeleteAfter
-		}
-		return nil
-	}
-	if len(c.After) == 0 {
-		return ErrMissingAfter
-	}
-	seenAfter := make(map[string]bool, len(c.After))
-	for _, f := range c.After {
-		if err := checkField(f, seenAfter); err != nil {
-			return err
-		}
-	}
-	switch c.Op {
-	case Insert:
-		for _, k := range c.Key {
-			if !seenAfter[k.Name] {
-				return errWrap(ErrMissingKeyColumn, k.Name)
-			}
-		}
-	case Update:
-		// The key may be repeated in the after-image when the image is a full row.
-		// A different value would change the primary key, which apply cannot track.
-		keyVal := make(map[string]Value, len(c.Key))
-		for _, k := range c.Key {
-			keyVal[k.Name] = k.Value
-		}
-		for _, f := range c.After {
-			kv, ok := keyVal[f.Name]
-			if ok && (kv.Type != f.Value.Type || kv.Data != f.Value.Data) {
-				return ErrPrimaryKeyUpdate
-			}
-		}
-	}
 	return nil
-}
-
-func checkField(f Field, seen map[string]bool) error {
-	if err := ValidIdent(f.Name); err != nil {
-		return err
-	}
-	if seen[f.Name] {
-		return errWrap(ErrDuplicateColumn, f.Name)
-	}
-	seen[f.Name] = true
-	if _, err := f.Value.Bind(); err != nil {
-		return err
-	}
-	return nil
-}
-
-// CompleteAfter reports whether After contains every key column, so an
-// applier can upsert the row when an update matches nothing.
-func (c Change) CompleteAfter() bool {
-	have := make(map[string]bool, len(c.After))
-	for _, f := range c.After {
-		have[f.Name] = true
-	}
-	for _, k := range c.Key {
-		if !have[k.Name] {
-			return false
-		}
-	}
-	return len(c.Key) > 0
 }

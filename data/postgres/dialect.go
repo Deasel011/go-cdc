@@ -18,8 +18,6 @@ func (Dialect) Driver() string { return "pgx" }
 
 func (Dialect) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
 
-func (Dialect) Quote(ident string) (string, error) { return data.QuoteIdent(ident) }
-
 func (Dialect) OutboxDDL() string {
 	return `CREATE TABLE IF NOT EXISTS "cdc_outbox" (
 		"id" BIGSERIAL PRIMARY KEY,

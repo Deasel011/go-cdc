@@ -283,13 +283,13 @@ func (s *ReplicationSuite) BothSidesShowTheRowLeftAfterADelete() {
 }
 
 func (s *ReplicationSuite) AnUnsupportedWriteIsAttempted() {
-	// A literal INSERT would succeed on Postgres if the wrapper executed it.
-	_, err := s.pg.ExecContext(s.T().Context(), `INSERT INTO items (id, name, qty, note) VALUES (2, 'bad', 1, 'x')`)
+	// database/sql would run this. Capture refuses it first, so the table stays.
+	_, err := s.pg.ExecContext(s.T().Context(), `DROP TABLE items`)
 	s.rejected = err
 }
 
 func (s *ReplicationSuite) TheWriteIsRejectedAndNothingIsStored() {
-	s.Require().ErrorIs(s.rejected, capture.ErrUnsupportedStatement)
+	s.Require().ErrorIs(s.rejected, cdc.ErrUnsupportedStatement)
 	var n int64
 	s.Require().NoError(s.pg.QueryRowContext(s.T().Context(), `SELECT COUNT(*) FROM items`).Scan(&n))
 	s.Require().Zero(n)
@@ -422,11 +422,7 @@ func (s *ReplicationSuite) AMaliciousEventIsPublished() {
 		Origin: "attacker",
 		Seq:    1,
 		Op:     cdc.Delete,
-		Table:  `items"; DROP TABLE items; --`,
-		Key: []cdc.Field{{
-			Name:  "id",
-			Value: cdc.Value{Type: "int", Data: "1"},
-		}},
+		SQL:    `DROP TABLE items`,
 	}
 	body, err := json.Marshal(ev)
 	s.Require().NoError(err)
@@ -445,12 +441,12 @@ func (s *ReplicationSuite) TheApplierStopsAndTheTableRemains() {
 		}, s.liteStore)
 	})
 	good := cdc.Change{
-		ID: "good-1", Origin: "postgres", Seq: 2, Op: cdc.Insert, Table: "items",
-		Key: []cdc.Field{{Name: "id", Value: cdc.Value{Type: "int", Data: "1"}}},
-		After: []cdc.Field{
-			{Name: "id", Value: cdc.Value{Type: "int", Data: "1"}},
-			{Name: "name", Value: cdc.Value{Type: "string", Data: "ok"}},
-			{Name: "qty", Value: cdc.Value{Type: "int", Data: "1"}},
+		ID: "good-1", Origin: "postgres", Seq: 2, Op: cdc.Insert,
+		SQL: `INSERT INTO items (id, name, qty) VALUES (?, ?, ?)`,
+		Args: []cdc.Value{
+			{Type: "int", Data: "1"},
+			{Type: "string", Data: "ok"},
+			{Type: "int", Data: "1"},
 		},
 	}
 	body, err := json.Marshal(good)

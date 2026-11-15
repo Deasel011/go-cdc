@@ -10,8 +10,6 @@ type Dialect interface {
 	Driver() string
 	// Placeholder is the nth bound parameter, 1-based.
 	Placeholder(n int) string
-	// Quote quotes an identifier. Names that fail cdc.ValidIdent are rejected.
-	Quote(ident string) (string, error)
 	OutboxDDL() string
 	AppliedDDL() string
 	// PrepareDSN returns the DSN to open. It may append engine defaults.
@@ -25,11 +23,9 @@ type Dialect interface {
 	IsConflict(err error) bool
 }
 
-// AppliedDDL is the bookkeeping table shared by engines that accept this SQL.
+// AppliedDDL records the newest sequence applied from each origin.
+// One row per origin is enough: a capture's sequence is totally ordered.
 const AppliedDDL = `CREATE TABLE IF NOT EXISTS "cdc_applied" (
-	"origin" TEXT NOT NULL,
-	"tbl" TEXT NOT NULL,
-	"key" TEXT NOT NULL,
-	"seq" BIGINT NOT NULL,
-	PRIMARY KEY ("origin", "tbl", "key")
+	"origin" TEXT PRIMARY KEY,
+	"seq" BIGINT NOT NULL
 )`
